@@ -5,9 +5,14 @@ import io.floci.emrclone.control.Controller;
 import io.floci.emrclone.floci.FlociClient;
 import io.floci.emrclone.runtime.DockerRuntime;
 import io.floci.emrclone.state.StepStore;
+import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.logging.FileHandler;
+import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
 
 public final class Main {
     private static final Logger LOG = Logger.getLogger(Main.class.getName());
@@ -15,6 +20,7 @@ public final class Main {
     public static void main(String[] args) throws Exception {
         FlociClient floci = new FlociClient(URI.create(env("FLOCI_ENDPOINT", "http://localhost:4566")));
         Path data = Path.of(env("EMR_DATA_DIR", "data"));
+        configureLogging(data);
         StepStore state = new StepStore(data.resolve("steps.json"));
         DockerRuntime runtime = new DockerRuntime(floci,
                 env("EMR_SPARK_IMAGE", "apache/spark:3.5.7-python3"),
@@ -32,5 +38,15 @@ public final class Main {
     private static String env(String name, String fallback) {
         String value = System.getenv(name);
         return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private static void configureLogging(Path dataDir) throws IOException {
+        Files.createDirectories(dataDir);
+        FileHandler file = new FileHandler(dataDir.resolve("emr-service-%g.log").toString(),
+                10 * 1024 * 1024, 5, true);
+        file.setFormatter(new SimpleFormatter());
+        Logger root = Logger.getLogger("");
+        root.setLevel(Level.INFO);
+        root.addHandler(file);
     }
 }

@@ -29,6 +29,7 @@ public final class Controller {
     private final Path dataDir;
     private final ExecutorService jobs = Executors.newCachedThreadPool();
     private final Set<String> runningClusters = ConcurrentHashMap.newKeySet();
+    private final Set<String> announcedTerminatedClusters = ConcurrentHashMap.newKeySet();
     private final Map<String, String> clusterErrors = new ConcurrentHashMap<>();
 
     public Controller(FlociClient floci, DockerRuntime runtime, StepStore state, Path dataDir) {
@@ -45,6 +46,9 @@ public final class Controller {
             seen.add(id);
             String clusterState = floci.describeCluster(id).path("Status").path("State").asText();
             if (clusterState.equals("TERMINATED") || clusterState.equals("TERMINATED_WITH_ERRORS")) {
+                if (announcedTerminatedClusters.add(id)) {
+                    LOG.info(() -> "emr.cluster.terminated cluster=" + id + " state=" + clusterState);
+                }
                 runtime.removeCluster(id);
                 state.forgetCluster(id);
                 continue;
@@ -63,6 +67,10 @@ public final class Controller {
                 continue;
             }
             try {
+                int requestedPrimaryCount = primaryCount;
+                int requestedCoreCount = coreCount;
+                LOG.fine(() -> "emr.cluster.reconcile cluster=" + id + " state=" + clusterState
+                        + " primaryCount=" + requestedPrimaryCount + " coreCount=" + requestedCoreCount);
                 runtime.ensureCluster(id, coreCount);
                 clusterErrors.remove(id);
                 state.rememberCluster(id);
@@ -74,6 +82,7 @@ public final class Controller {
         }
         for (String id : state.knownClusters()) {
             if (!seen.contains(id)) {
+                LOG.info(() -> "emr.cluster.no-longer-in-floci cluster=" + id);
                 runtime.removeCluster(id);
                 state.forgetCluster(id);
             }
@@ -90,6 +99,7 @@ public final class Controller {
             String stepId = step.path("Id").asText();
             StepStore.StepRecord record = state.get(id, stepId);
             if (record != null && record.state().equals("PENDING") && runningClusters.add(id)) {
+                LOG.info(() -> "emr.step.queued cluster=" + id + " step=" + stepId);
                 jobs.submit(() -> execute(id, step));
                 break;
             }
@@ -100,14 +110,21 @@ public final class Controller {
         String stepId = step.path("Id").asText();
         try {
             state.transition(clusterId, stepId, "RUNNING", null);
+            LOG.info(() -> "emr.step.started cluster=" + clusterId + " step=" + stepId
+                    + " name=" + step.path("Name").asText("unknown"));
             Path log = dataDir.resolve("logs").resolve(clusterId).resolve(stepId + ".log");
             int code = runtime.executeStep(clusterId, step, log);
-            state.transition(clusterId, stepId, code == 0 ? "COMPLETED" : "FAILED",
+            String finalState = code == 0 ? "COMPLETED" : "FAILED";
+            state.transition(clusterId, stepId, finalState,
                     code == 0 ? null : "spark-submit exited with code " + code);
+            LOG.info(() -> "emr.step.finished cluster=" + clusterId + " step=" + stepId
+                    + " state=" + finalState + " exitCode=" + code + " applicationLog=" + log);
         } catch (Exception exception) {
             LOG.log(Level.WARNING, "Step " + stepId + " failed", exception);
             try {
                 state.transition(clusterId, stepId, "FAILED", exception.getMessage());
+                LOG.warning("emr.step.finished cluster=" + clusterId + " step=" + stepId
+                        + " state=FAILED error=" + exception.getMessage());
             } catch (IOException saveFailure) {
                 LOG.log(Level.SEVERE, "Cannot save failure status for " + stepId, saveFailure);
             }

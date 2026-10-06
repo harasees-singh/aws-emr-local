@@ -10,13 +10,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
 
 /** Starts real Spark primary and core nodes through the Docker CLI. */
 public final class DockerRuntime {
+    private static final Logger LOG = Logger.getLogger(DockerRuntime.class.getName());
     private static final Set<String> OPTIONS_WITH_VALUE = Set.of("--class", "--conf", "--name", "--jars",
             "--py-files", "--files", "--archives", "--packages", "--repositories", "--driver-memory",
             "--executor-memory", "--executor-cores", "--num-executors", "--total-executor-cores");
@@ -25,6 +30,12 @@ public final class DockerRuntime {
     private final String image;
     private final String network;
     private final String flociContainer;
+    private final Set<String> announcedMasters = ConcurrentHashMap.newKeySet();
+    private final Set<String> announcedWorkers = ConcurrentHashMap.newKeySet();
+    private final Set<String> announcedResources = ConcurrentHashMap.newKeySet();
+    private final Map<String, Map<String, WorkerCapacity>> workerCapacities = new ConcurrentHashMap<>();
+
+    record WorkerCapacity(int cores, int memoryMb) {}
 
     public DockerRuntime(FlociClient floci, String image, String network, String flociContainer) {
         this.floci = floci;
@@ -96,6 +107,7 @@ public final class DockerRuntime {
             }
             if (!existing.path("State").path("Running").asBoolean()) {
                 requiredDocker(Duration.ofSeconds(30), "start", name);
+                LOG.info(() -> "emr.node.started cluster=" + clusterId + " role=" + role + " container=" + name + " image=" + image + " reused=true");
             }
             return;
         }
@@ -104,11 +116,12 @@ public final class DockerRuntime {
                 "--label", "io.emr-clone.role=" + role));
         if (role.equals("primary")) {
             // Docker chooses an available host port; `docker port <name> 8080/tcp` reveals it.
-            args.addAll(List.of("--publish", "8080"));
+            args.addAll(List.of("--publish", "8080", "--publish", "4040"));
         }
         args.addAll(List.of("--entrypoint", "/opt/spark/bin/spark-class", image));
         args.addAll(sparkArgs);
         requiredDocker(Duration.ofMinutes(3), args.toArray(String[]::new));
+        LOG.info(() -> "emr.node.started cluster=" + clusterId + " role=" + role + " container=" + name + " image=" + image);
     }
 
     public void ensureCluster(String clusterId, int coreCount) throws IOException, InterruptedException {
@@ -126,20 +139,88 @@ public final class DockerRuntime {
         if (docker(Duration.ofSeconds(10), "exec", primary, "python3", "-c", socketProbe).code != 0) {
             throw new IOException("Spark master did not open port 7077: " + primary);
         }
+        if (announcedMasters.add(clusterId)) {
+            LOG.info(() -> "spark.master.ready cluster=" + clusterId + " container=" + primary);
+        }
         for (int i = 1; i <= coreCount; i++) {
             String core = coreName(clusterId, i);
             startNode(clusterId, "core", core, List.of("org.apache.spark.deploy.worker.Worker",
                     "--host", core, "--cores", "1", "--memory", "2G", "spark://" + primary + ":7077"));
         }
+        workerCapacities.put(clusterId, awaitWorkers(clusterId, primary, coreCount, Duration.ofSeconds(45)));
+    }
+
+    private Map<String, WorkerCapacity> awaitWorkers(String clusterId, String primary, int expected, Duration timeout)
+            throws IOException, InterruptedException {
+        int uiPort = publishedPort(primary, 8080);
+        long deadline = System.nanoTime() + timeout.toNanos();
+        JsonNode workerNodes = json.createArrayNode();
+        while (System.nanoTime() < deadline) {
+            CommandResult result = docker(Duration.ofSeconds(5), "exec", primary, "python3", "-c",
+                    "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/json/').read().decode())");
+            if (result.code == 0) {
+                JsonNode status = json.readTree(result.output);
+                workerNodes = status.path("workers");
+                long alive = 0;
+                for (JsonNode worker : workerNodes) if (worker.path("state").asText().equals("ALIVE")) alive++;
+                if (alive >= expected) break;
+            }
+            Thread.sleep(500);
+        }
+        int alive = 0;
+        Map<String, WorkerCapacity> capacities = new HashMap<>();
+        for (JsonNode worker : workerNodes) {
+            if (!worker.path("state").asText().equals("ALIVE")) continue;
+            alive++;
+            String workerId = worker.path("id").asText();
+            String host = worker.path("host").asText();
+            int cores = worker.path("cores").asInt();
+            int memoryMb = worker.path("memory").asInt();
+            capacities.put(host, new WorkerCapacity(cores, memoryMb));
+            if (announcedWorkers.add(clusterId + "/" + workerId)) {
+                LOG.info(() -> "spark.worker.registered cluster=" + clusterId + " worker="
+                        + workerId + " host=" + host
+                        + " cores=" + cores + " memoryMb=" + memoryMb
+                        + " state=" + worker.path("state").asText());
+            }
+        }
+        int registeredWorkers = alive;
+        if (announcedResources.add(clusterId)) {
+            LOG.info(() -> "spark.resources.visible cluster=" + clusterId + " expectedCoreWorkers=" + expected
+                    + " registeredWorkers=" + registeredWorkers + " masterUi=http://localhost:" + uiPort);
+        }
+        if (alive < expected) throw new IOException("Spark master registered " + alive + " of " + expected + " core workers");
+        return Map.copyOf(capacities);
+    }
+
+    private int publishedPort(String container, int containerPort) throws IOException, InterruptedException {
+        String result = requiredDocker(Duration.ofSeconds(10), "port", container, containerPort + "/tcp");
+        for (String line : result.split("\\R")) {
+            int colon = line.lastIndexOf(':');
+            if (colon >= 0) {
+                try { return Integer.parseInt(line.substring(colon + 1).trim()); }
+                catch (NumberFormatException ignored) { }
+            }
+        }
+        throw new IOException("Docker did not publish " + containerPort + "/tcp for " + container);
     }
 
     public void removeCluster(String clusterId) throws IOException, InterruptedException {
         slug(clusterId);
         String ids = requiredDocker(Duration.ofSeconds(15), "ps", "-aq", "--filter",
                 "label=io.emr-clone.cluster=" + clusterId, "--filter", "label=io.emr-clone.role");
+        boolean removed = false;
         for (String id : ids.split("\\R")) {
-            if (!id.isBlank()) requiredDocker(Duration.ofSeconds(30), "rm", "-f", id);
+            if (!id.isBlank()) {
+                requiredDocker(Duration.ofSeconds(30), "rm", "-f", id);
+                removed = true;
+            }
         }
+        announcedWorkers.removeIf(key -> key.startsWith(clusterId + "/"));
+        announcedMasters.remove(clusterId);
+        announcedResources.remove(clusterId);
+        workerCapacities.remove(clusterId);
+        if (removed) LOG.info(() -> "emr.cluster.nodes-removed cluster=" + clusterId);
     }
 
     public int executeStep(String clusterId, JsonNode step, Path logPath) throws IOException, InterruptedException {
@@ -181,14 +262,29 @@ public final class DockerRuntime {
             }
         }
         String primary = primaryName(clusterId);
+        int sparkUiPort = publishedPort(primary, 4040);
+        String eventLogDirectory = "/tmp/emr-eventlogs/" + step.path("Id").asText();
+        requiredDocker(Duration.ofSeconds(15), "exec", primary, "mkdir", "-p", eventLogDirectory);
         List<String> command = new ArrayList<>(List.of("docker", "exec", "-e", "SPARK_LOCAL_IP=" + primary,
                 primary, "/opt/spark/bin/spark-submit", "--master", "spark://" + primary + ":7077",
                 "--deploy-mode", "client", "--conf", "spark.driver.host=" + primary,
-                "--conf", "spark.driver.bindAddress=0.0.0.0"));
+                "--conf", "spark.driver.bindAddress=0.0.0.0", "--conf", "spark.ui.port=4040",
+                "--conf", "spark.eventLog.enabled=true", "--conf", "spark.eventLog.compress=false",
+                "--conf", "spark.eventLog.dir=file://" + eventLogDirectory));
         command.addAll(args);
         Files.createDirectories(logPath.getParent());
         Process process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(logPath.toFile()).start();
-        return process.waitFor();
+        String stepId = step.path("Id").asText();
+        LOG.info(() -> "spark.step.submitted cluster=" + clusterId + " step=" + stepId
+                + " manager=standalone master=" + primary + ":7077 ui=http://localhost:" + sparkUiPort);
+        SparkUiMonitor monitor = new SparkUiMonitor(stepId, sparkUiPort,
+                workerCapacities.getOrDefault(clusterId, Map.of()));
+        while (!process.waitFor(500, TimeUnit.MILLISECONDS)) monitor.poll();
+        monitor.readEventLog(primary, eventLogDirectory);
+        monitor.finish();
+        int exitCode = process.exitValue();
+        LOG.info(() -> "spark.step.process-finished cluster=" + clusterId + " step=" + stepId + " exitCode=" + exitCode);
+        return exitCode;
     }
 
     private static int applicationIndex(List<String> args) {

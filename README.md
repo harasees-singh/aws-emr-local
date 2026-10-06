@@ -12,6 +12,7 @@ src/main/java/io/floci/emrclone/     Java application code
   control/Controller.java            Cluster and step reconciliation
   floci/FlociClient.java             Floci EMR and S3 HTTP client
   runtime/DockerRuntime.java         Primary/core containers and spark-submit
+  runtime/SparkUiMonitor.java        Executor and task placement from Spark UI
   state/StepStore.java               Durable local step state
 data/                                Runtime state and step logs (ignored by Git)
 ```
@@ -68,6 +69,23 @@ docker port "emr-$(printf '%s' "$CLUSTER_ID" | tr '[:upper:]' '[:lower:]')-prima
 ```
 
 Open the returned `localhost:<port>` address and confirm both core workers are `ALIVE`. The step log is saved under `data/logs/<cluster-id>/<step-id>.log`; its executor registration lines include each worker's Docker network address.
+
+The Java service also writes an event stream to its standard output. Key events include:
+
+```text
+emr.node.started ... role=primary|core ...
+spark.worker.registered ... host=... cores=... memoryMb=...
+spark.resources.visible ... registeredWorkers=2 ...
+emr.step.started ...
+spark.application.registered ...
+spark.executor.registered ... host=... cpuCores=1 workerMemoryMb=2048 storageMemoryAvailableBytes=...
+spark.task ... partition=... executor=... host=... status=SUCCESS
+spark.eventlog.replayed ... taskEndEvents=100
+spark.application.task-summary ... tasksByHost={core-1=50, core-2=50} completedTasksObserved=100
+emr.step.finished ... state=COMPLETED exitCode=0 ...
+```
+
+These records show the Spark master's worker inventory, executor placement, and the host that ran each task partition. The executor event includes its CPU slots, the hosting worker's advertised core and memory capacity, and Spark storage-memory usage and capacity. Storage memory is the portion Spark uses for cached data; it is not the executor JVM heap size. Spark UI polling provides live updates; after the application exits, the service replays Spark's event log to fill in any task events that happened between polls. Service events are written both to the console and to rotating `data/emr-service-*.log` files. Spark's own driver and executor output remains in `data/logs/<cluster-id>/<step-id>.log`.
 
 Configuration uses environment variables: `FLOCI_ENDPOINT`, `FLOCI_CONTAINER`, `EMR_PROXY_HOST`, `EMR_PROXY_PORT`, `EMR_SPARK_IMAGE`, `EMR_DOCKER_NETWORK`, and `EMR_DATA_DIR`.
 

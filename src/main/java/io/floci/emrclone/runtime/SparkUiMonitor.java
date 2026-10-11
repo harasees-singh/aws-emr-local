@@ -3,17 +3,16 @@ package io.floci.emrclone.runtime;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.io.IOException;
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -140,10 +139,10 @@ final class SparkUiMonitor {
     }
 
     synchronized void readEventLog(String primary, String eventLogDirectory) throws IOException, InterruptedException {
-        CommandResult result = docker(Duration.ofSeconds(20), "exec", primary, "find", eventLogDirectory,
+        DockerCommand.Result result = DockerCommand.run(Duration.ofSeconds(20), "exec", primary, "find", eventLogDirectory,
                 "-maxdepth", "1", "-type", "f");
-        if (result.code != 0) throw new IOException("Cannot list Spark event log: " + result.output);
-        List<String> eventFiles = result.output.lines().map(String::trim).filter(value -> !value.isBlank()).toList();
+        if (result.exitCode() != 0) throw new IOException("Cannot list Spark event log: " + result.output());
+        List<String> eventFiles = result.output().lines().map(String::trim).filter(value -> !value.isBlank()).toList();
         int taskEndEvents = 0;
         for (String eventFile : eventFiles) {
             Path localCopy = Files.createTempFile("spark-eventlog-", ".jsonl");
@@ -171,8 +170,8 @@ final class SparkUiMonitor {
         int replayedTaskEndEvents = taskEndEvents;
         LOG.info(() -> "spark.eventlog.replayed step=" + stepId + " files=" + eventFiles.size()
                 + " taskEndEvents=" + replayedTaskEndEvents);
-        CommandResult cleanup = docker(Duration.ofSeconds(20), "exec", primary, "rm", "-rf", eventLogDirectory);
-        if (cleanup.code != 0) LOG.warning("Cannot remove temporary Spark event log for step " + stepId + ": " + cleanup.output);
+        DockerCommand.Result cleanup = DockerCommand.run(Duration.ofSeconds(20), "exec", primary, "rm", "-rf", eventLogDirectory);
+        if (cleanup.exitCode() != 0) LOG.warning("Cannot remove temporary Spark event log for step " + stepId + ": " + cleanup.output());
     }
 
     private void logTaskEnd(JsonNode event) {
@@ -207,20 +206,6 @@ final class SparkUiMonitor {
 
     private int completedTasksByHost() {
         return tasksByHost.values().stream().mapToInt(Integer::intValue).sum();
-    }
-
-    private record CommandResult(int code, String output) {}
-
-    private static CommandResult docker(Duration timeout, String... args) throws IOException, InterruptedException {
-        List<String> command = new ArrayList<>();
-        command.add("docker");
-        command.addAll(List.of(args));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-            process.destroyForcibly();
-            throw new IOException("Timed out: docker " + String.join(" ", List.of(args)));
-        }
-        return new CommandResult(process.exitValue(), new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
     }
 
     private JsonNode get(String path) {

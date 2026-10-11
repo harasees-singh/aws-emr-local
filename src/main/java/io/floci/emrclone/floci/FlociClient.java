@@ -19,6 +19,10 @@ import java.time.Duration;
 
 /** Talks to Floci's existing EMR JSON 1.1 control plane. */
 public final class FlociClient {
+    public static final class UpstreamException extends IOException {
+        public UpstreamException(String message) { super(message); }
+        public UpstreamException(String message, IOException cause) { super(message, cause); }
+    }
     private final URI endpoint;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final ObjectMapper json = new ObjectMapper();
@@ -38,9 +42,14 @@ public final class FlociClient {
                 .header("X-Amz-Target", "ElasticMapReduce." + operation)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(json.writeValueAsBytes(payload)))
                 .build();
-        HttpResponse<byte[]> response = http.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        HttpResponse<byte[]> response;
+        try {
+            response = http.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        } catch (IOException exception) {
+            throw new UpstreamException("Floci " + operation + " request failed", exception);
+        }
         if (response.statusCode() / 100 != 2) {
-            throw new IOException("Floci " + operation + " returned HTTP " + response.statusCode() + ": "
+            throw new UpstreamException("Floci " + operation + " returned HTTP " + response.statusCode() + ": "
                     + new String(response.body(), StandardCharsets.UTF_8));
         }
         return (ObjectNode) json.readTree(response.body());

@@ -57,34 +57,19 @@ public final class DockerRuntime {
         return clusterId.toLowerCase(Locale.ROOT);
     }
 
-    private record CommandResult(int code, String output) {}
-
-    private static CommandResult docker(Duration timeout, String... args) throws IOException, InterruptedException {
-        List<String> command = new ArrayList<>();
-        command.add("docker");
-        command.addAll(List.of(args));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        boolean exited = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        if (!exited) {
-            process.destroyForcibly();
-            throw new IOException("Timed out: docker " + String.join(" ", List.of(args)));
-        }
-        return new CommandResult(process.exitValue(), new String(process.getInputStream().readAllBytes()));
-    }
-
     private static String requiredDocker(Duration timeout, String... args) throws IOException, InterruptedException {
-        CommandResult result = docker(timeout, args);
-        if (result.code != 0) throw new IOException("docker " + String.join(" ", List.of(args)) + ": " + result.output);
-        return result.output;
+        DockerCommand.Result result = DockerCommand.run(timeout, args);
+        if (result.exitCode() != 0) throw new IOException("docker " + String.join(" ", List.of(args)) + ": " + result.output());
+        return result.output();
     }
 
     private JsonNode inspect(String name) throws IOException, InterruptedException {
-        CommandResult result = docker(Duration.ofSeconds(15), "inspect", name);
-        return result.code == 0 ? json.readTree(result.output).get(0) : null;
+        DockerCommand.Result result = DockerCommand.run(Duration.ofSeconds(15), "inspect", name);
+        return result.exitCode() == 0 ? json.readTree(result.output()).get(0) : null;
     }
 
     private void ensureNetwork() throws IOException, InterruptedException {
-        if (docker(Duration.ofSeconds(15), "network", "inspect", network).code != 0) {
+        if (DockerCommand.run(Duration.ofSeconds(15), "network", "inspect", network).exitCode() != 0) {
             requiredDocker(Duration.ofSeconds(30), "network", "create", "--label", "io.emr-clone.managed=true", network);
         }
         JsonNode containers = json.readTree(requiredDocker(Duration.ofSeconds(15), "network", "inspect", network))
@@ -133,10 +118,10 @@ public final class DockerRuntime {
         long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
         String socketProbe = "import socket; s=socket.create_connection((socket.gethostname(),7077),2); s.close()";
         while (System.nanoTime() < deadline) {
-            if (docker(Duration.ofSeconds(10), "exec", primary, "python3", "-c", socketProbe).code == 0) break;
+            if (DockerCommand.run(Duration.ofSeconds(10), "exec", primary, "python3", "-c", socketProbe).exitCode() == 0) break;
             Thread.sleep(1000);
         }
-        if (docker(Duration.ofSeconds(10), "exec", primary, "python3", "-c", socketProbe).code != 0) {
+        if (DockerCommand.run(Duration.ofSeconds(10), "exec", primary, "python3", "-c", socketProbe).exitCode() != 0) {
             throw new IOException("Spark master did not open port 7077: " + primary);
         }
         if (announcedMasters.add(clusterId)) {
@@ -156,10 +141,10 @@ public final class DockerRuntime {
         long deadline = System.nanoTime() + timeout.toNanos();
         JsonNode workerNodes = json.createArrayNode();
         while (System.nanoTime() < deadline) {
-            CommandResult result = docker(Duration.ofSeconds(5), "exec", primary, "python3", "-c",
+            DockerCommand.Result result = DockerCommand.run(Duration.ofSeconds(5), "exec", primary, "python3", "-c",
                     "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/json/').read().decode())");
-            if (result.code == 0) {
-                JsonNode status = json.readTree(result.output);
+            if (result.exitCode() == 0) {
+                JsonNode status = json.readTree(result.output());
                 workerNodes = status.path("workers");
                 long alive = 0;
                 for (JsonNode worker : workerNodes) if (worker.path("state").asText().equals("ALIVE")) alive++;
@@ -279,7 +264,14 @@ public final class DockerRuntime {
                 + " manager=standalone master=" + primary + ":7077 ui=http://localhost:" + sparkUiPort);
         SparkUiMonitor monitor = new SparkUiMonitor(stepId, sparkUiPort,
                 workerCapacities.getOrDefault(clusterId, Map.of()));
-        while (!process.waitFor(500, TimeUnit.MILLISECONDS)) monitor.poll();
+        try {
+            while (!process.waitFor(500, TimeUnit.MILLISECONDS)) monitor.poll();
+        } catch (InterruptedException exception) {
+            process.destroyForcibly();
+            process.waitFor();
+            Thread.currentThread().interrupt();
+            throw exception;
+        }
         monitor.readEventLog(primary, eventLogDirectory);
         monitor.finish();
         int exitCode = process.exitValue();

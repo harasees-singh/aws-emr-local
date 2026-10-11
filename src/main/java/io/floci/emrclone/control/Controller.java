@@ -4,12 +4,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.emrclone.floci.FlociClient;
 import io.floci.emrclone.runtime.DockerRuntime;
 import io.floci.emrclone.state.StepStore;
+import io.floci.emrclone.state.StepStore.StepState;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -21,8 +20,10 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /** Polls Floci for clusters and steps and reconciles actual Docker compute. */
-public final class Controller {
+public final class Controller implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger(Controller.class.getName());
+    private static final Set<String> RECONCILABLE_CLUSTER_STATES =
+            Set.of("STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING");
     private final FlociClient floci;
     private final DockerRuntime runtime;
     private final StepStore state;
@@ -53,7 +54,7 @@ public final class Controller {
                 state.forgetCluster(id);
                 continue;
             }
-            if (!Set.of("STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING").contains(clusterState)) continue;
+            if (!RECONCILABLE_CLUSTER_STATES.contains(clusterState)) continue;
             int primaryCount = 0;
             int coreCount = 0;
             for (JsonNode group : floci.listInstanceGroups(id)) {
@@ -76,7 +77,7 @@ public final class Controller {
                 state.rememberCluster(id);
                 reconcileSteps(id);
             } catch (IOException | RuntimeException exception) {
-                clusterErrors.put(id, exception.getMessage());
+                clusterErrors.put(id, errorMessage(exception));
                 LOG.log(Level.WARNING, "Cannot reconcile cluster " + id, exception);
             }
         }
@@ -92,13 +93,14 @@ public final class Controller {
     private void reconcileSteps(String id) throws IOException, InterruptedException {
         List<JsonNode> steps = new ArrayList<>();
         floci.listSteps(id).forEach(steps::add);
-        Collections.reverse(steps); // Floci returns newest first; execute oldest first.
         for (JsonNode step : steps) state.remember(id, step.path("Id").asText());
         if (runningClusters.contains(id)) return;
-        for (JsonNode step : steps) {
+        // Floci returns newest first; walk backward to execute the oldest pending step first.
+        for (int index = steps.size() - 1; index >= 0; index--) {
+            JsonNode step = steps.get(index);
             String stepId = step.path("Id").asText();
             StepStore.StepRecord record = state.get(id, stepId);
-            if (record != null && record.state().equals("PENDING") && runningClusters.add(id)) {
+            if (record != null && record.state() == StepState.PENDING && runningClusters.add(id)) {
                 LOG.info(() -> "emr.step.queued cluster=" + id + " step=" + stepId);
                 jobs.submit(() -> execute(id, step));
                 break;
@@ -106,15 +108,20 @@ public final class Controller {
         }
     }
 
+    private static String errorMessage(Exception exception) {
+        String message = exception.getMessage();
+        return message == null || message.isBlank() ? exception.getClass().getSimpleName() : message;
+    }
+
     private void execute(String clusterId, JsonNode step) {
         String stepId = step.path("Id").asText();
         try {
-            state.transition(clusterId, stepId, "RUNNING", null);
+            state.transition(clusterId, stepId, StepState.RUNNING, null);
             LOG.info(() -> "emr.step.started cluster=" + clusterId + " step=" + stepId
                     + " name=" + step.path("Name").asText("unknown"));
             Path log = dataDir.resolve("logs").resolve(clusterId).resolve(stepId + ".log");
             int code = runtime.executeStep(clusterId, step, log);
-            String finalState = code == 0 ? "COMPLETED" : "FAILED";
+            StepState finalState = code == 0 ? StepState.COMPLETED : StepState.FAILED;
             state.transition(clusterId, stepId, finalState,
                     code == 0 ? null : "spark-submit exited with code " + code);
             LOG.info(() -> "emr.step.finished cluster=" + clusterId + " step=" + stepId
@@ -122,7 +129,7 @@ public final class Controller {
         } catch (Exception exception) {
             LOG.log(Level.WARNING, "Step " + stepId + " failed", exception);
             try {
-                state.transition(clusterId, stepId, "FAILED", exception.getMessage());
+                state.transition(clusterId, stepId, StepState.FAILED, errorMessage(exception));
                 LOG.warning("emr.step.finished cluster=" + clusterId + " step=" + stepId
                         + " state=FAILED error=" + exception.getMessage());
             } catch (IOException saveFailure) {
@@ -140,9 +147,28 @@ public final class Controller {
     public void runForever() throws IOException, InterruptedException {
         state.markInterrupted();
         while (!Thread.currentThread().isInterrupted()) {
-            try { reconcile(); }
-            catch (Exception exception) { LOG.log(Level.WARNING, "Reconciliation failed; retrying", exception); }
+            try {
+                reconcile();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception exception) {
+                LOG.log(Level.WARNING, "Reconciliation failed; retrying", exception);
+            }
             Thread.sleep(2000);
+        }
+    }
+
+    @Override
+    public void close() {
+        jobs.shutdown();
+        try {
+            if (!jobs.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                jobs.shutdownNow();
+            }
+        } catch (InterruptedException exception) {
+            jobs.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 }

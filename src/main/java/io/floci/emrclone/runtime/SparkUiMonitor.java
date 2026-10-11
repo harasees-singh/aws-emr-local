@@ -27,7 +27,7 @@ final class SparkUiMonitor {
     private static final int TASK_LIST_LIMIT = 2000;
     private final String stepId;
     private final URI base;
-    private final Map<String, DockerRuntime.WorkerCapacity> workerCapacities;
+    private final Map<String, DockerRuntime.NodeCapacity> nodeCapacities;
     private final ObjectMapper json = new ObjectMapper();
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(500)).build();
     private final Set<String> previousApps = new HashSet<>();
@@ -37,10 +37,10 @@ final class SparkUiMonitor {
     private String applicationId;
     private String applicationName;
 
-    SparkUiMonitor(String stepId, int hostPort, Map<String, DockerRuntime.WorkerCapacity> workerCapacities) {
+    SparkUiMonitor(String stepId, int hostPort, Map<String, DockerRuntime.NodeCapacity> nodeCapacities) {
         this.stepId = stepId;
         this.base = URI.create("http://127.0.0.1:" + hostPort + "/api/v1/");
-        this.workerCapacities = Map.copyOf(workerCapacities);
+        this.nodeCapacities = Map.copyOf(nodeCapacities);
         previousApps.addAll(applicationIds());
     }
 
@@ -98,11 +98,11 @@ final class SparkUiMonitor {
             JsonNode memoryMetrics = executor.path("memoryMetrics");
             long onHeapStorageUsedBytes = memoryMetrics.path("usedOnHeapStorageMemory").asLong(-1);
             long onHeapStorageTotalBytes = memoryMetrics.path("totalOnHeapStorageMemory").asLong(-1);
-            DockerRuntime.WorkerCapacity capacity = workerCapacities.get(host);
+            DockerRuntime.NodeCapacity capacity = nodeCapacities.get(host);
             LOG.info(() -> "spark.executor.registered step=" + stepId + " app=" + applicationId
                     + " executor=" + id + " host=" + host + " cpuCores=" + cores
-                    + " workerCores=" + (capacity == null ? "unknown" : capacity.cores())
-                    + " workerMemoryMb=" + (capacity == null ? "unknown" : capacity.memoryMb())
+                    + " yarnNodeVcores=" + (capacity == null ? "unknown" : capacity.vcores())
+                    + " yarnNodeMemoryMb=" + (capacity == null ? "unknown" : capacity.memoryMb())
                     + " storageMemoryUsedBytes=" + storageMemoryUsedBytes
                     + " storageMemoryAvailableBytes=" + storageMemoryAvailableBytes
                     + " onHeapStorageUsedBytes=" + onHeapStorageUsedBytes
